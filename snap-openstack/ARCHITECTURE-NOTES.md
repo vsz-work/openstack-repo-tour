@@ -129,7 +129,10 @@ The control-plane relations (keystone, nova, neutron, …) live in the external 
 
 ### Snap config (`snapctl` / snaphelpers)
 
-- **Defaults** are `daemon.group`, `daemon.debug`, `deployment.risk` and `deployment.version` (`hooks.py:18-23`), read by `snap-wrappers/commands/clusterd.start`.
+- **Defaults** are `daemon.group`, `daemon.debug`, `k8s.provider`, `deployment.risk` and `deployment.version` (`hooks.py:18-24`).
+  - `daemon.*` is read by `snap-wrappers/commands/clusterd.start`.
+  - `deployment.*` is read by `core/common.py:660,679`, and `k8s.provider` by `core/k8s.py:76`.
+  - See §5.2 for the details.
 - **Feature gates** use `feature.*` snap keys:
   - Snap → cluster DB: `hooks.py:92`, and the `SyncFeatureGatesToCluster` step (`steps/sync_feature_gates.py:12`).
   - Cluster DB → snap config: the Go watcher (`sunbeam-microcluster/sunbeam/feature_gate_sync.go`), started from `cmd/sunbeamd/main.go:91`.
@@ -383,3 +386,184 @@ Runs on the new node (`provider/local/commands.py:1405`). `-` reads the token fr
 | Juju registration token | `CreateJujuUserStep` (`juju add-user`) | The clusterd `jujuuser` table | `RegisterJujuUserStep` (`juju register`) |
 
 Both are tied to the node's FQDN.
+
+---
+
+## 5. Background concepts and follow-up notes
+
+### 5.1 Snap base and confinement (`snap/snapcraft.yaml:2`, `:10`)
+
+**`base: core24`**
+- The binaries inside the snap run on an Ubuntu 24.04 (Noble) runtime filesystem, which is shipped as a separate snap. They don't use the host's libraries.
+- So `sunbeam`, `sunbeamd` and `terraform` link against Noble's libc on any host, and the bundled Python is 3.12.
+- The base also sets which snapcraft syntax and rules apply (for example `layout:`).
+
+**`confinement: strict`**
+- Every app runs in a sandbox (AppArmor, seccomp, mount namespace).
+- Without extra permissions an app can only read `$SNAP` (read-only) and write to `$SNAP_DATA`, `$SNAP_COMMON` and `$SNAP_USER_*`.
+- Anything else needs a **plug**:
+  - Per-app plugs are at `:24-64`.
+    - `clusterd` only has `network` and `network-bind`.
+    - `sunbeam` has `home`, `ssh-keys` and the personal-files/system-files plugs.
+  - Custom plugs are at `:276-300`:
+    - `personal-files`: `~/.local/share/juju`, `~/.local/share/openstack`, `~/.config/openstack`
+    - `system-files`: `/etc/openstack`, read-only
+    - `juju-bin`, a **content** interface. The Juju snap mounts its binaries at `$SNAP/juju`, which is why `PATH` gets `$SNAP/juju/bin` added (`:53`, `:64`).
+  - `layout:` at `:20` maps `/usr/share/terraform/plugins` to the writable `$SNAP_DATA/terraform-plugins`.
+
+**What this means in practice**
+- Sensitive plugs only auto-connect if the store grants it. Otherwise they need `snap connect`. The code checks for this:
+  - `core/checks.py:259` checks that `ssh-keys` is connected.
+  - `commands/prepare_node.py:106` runs the connect command.
+- Local `--dangerous` installs get no auto-connections at all. `docs/CONTRIBUTING.md:64-71` and `.github/workflows/build-snap.yml:71` connect the plugs by hand.
+- "Permission denied" inside the snap usually means a missing plug. Check `snap connections openstack` and look for AppArmor `DENIED` lines in `journalctl`.
+- For comparison: `classic` confinement has no sandbox and needs store review; `devmode` logs violations instead of blocking them.
+
+### 5.2 How `hooks.py` reaches the snap
+
+`snapcraft.yaml` never names `hooks.py`. The link is made through snap-helpers when the snap is built:
+
+1. `sunbeam-python/pyproject.toml:124-127` declares entry points in the `snaphelpers.hooks` group:
+   - `configure` → `sunbeam.hooks:configure`
+   - `install` → `sunbeam.hooks:install`
+   - `post-refresh` → `sunbeam.hooks:upgrade`
+2. `snapcraft.yaml:258` runs `snap-helpers write-hooks` in the `override-prime` of the `sunbeam-and-openstackclients` part. That writes stub scripts into `meta/hooks/` in the primed snap, and each stub calls the matching Python function with a `snaphelpers.Snap`.
+3. snapd runs `meta/hooks/<name>` when the event happens. There's no `snap/hooks/` directory in the repo because the hooks are generated.
+
+| Hook | When it runs | Function | What it does |
+|---|---|---|---|
+| `install` | First install | `hooks.py:213` | Sets `DEFAULT_CONFIG` |
+| `configure` | After install and refresh, and on every `snap set openstack ...` | `hooks.py:242` | 1. Fills in missing defaults (`:29`).<br>2. Validates feature-gate dependencies; if this fails, snapd rolls back the `snap set`.<br>3. Syncs `feature.*` to clusterd (`:194`), or skips this if clusterd isn't up yet.<br>4. Writes `$SNAP_DATA/config.yaml` and restarts `clusterd` if `daemon.*` changed. |
+| `post-refresh` | After a refresh | `hooks.py:230` | Only sets up logging (a placeholder) |
+
+- Hooks log to `$SNAP_COMMON/hooks.log`.
+- If you rename or add a hook function, update the entry points too, or no stub is generated.
+
+### 5.3 The snapcraft lifecycle and "prime"
+
+Each part goes through these steps: **pull → build → stage → prime → pack**.
+
+| Step | Result |
+|---|---|
+| pull | Source in `parts/<part>/src` |
+| build | Plugin output in `parts/<part>/install` |
+| stage | All parts merged into `stage/`, so later parts can use it (`after:`) |
+| prime | Only what ships, in `prime/`. This is exactly what appears at `$SNAP` after install. |
+| pack | `prime/` squashed into the `.snap` file |
+
+- `override-<step>` replaces a step's default behaviour. `craftctl default` runs the default first.
+- In `override-prime` the current directory is the final snap contents. So the `sunbeam-and-openstackclients` part does three things there (`:255-268`), because each needs the finished Python environment:
+  - writes the snap hooks
+  - precompiles `.pyc` files, since `$SNAP` is read-only at runtime
+  - generates the bash completions
+- The `manifests` part's `override-prime` (`:222-230`) symlinks the 2026.1 manifests into `etc/manifests/`.
+- To look at the result: run `snapcraft prime` and inspect `prime/`, or run `unsquashfs -l` on a built snap.
+
+### 5.4 What "manifest" means here
+
+It means the **Sunbeam deployment manifest**: YAML with `core.software.charms` (channel, revision, config), optional `core.software.terraform` plan sources, `core.config` (deployment answers), `features` and `storage`. See §4B.
+
+**Embedded manifests**
+- They're stored as `manifests/<version>/{edge,beta,candidate,stable}.yml`, for 2024.1, 2025.1 and 2026.1.
+- Each one pins charm channels for that risk. For example, `2026.1/beta.yml` uses `2026.1/beta`.
+- They ship at `$SNAP/etc/manifests/`.
+- `embedded_manifest_path` (`core/manifest.py:39`) picks one from the `deployment.version` and `deployment.risk` snap config.
+
+**Which manifest is used** (`core/deployment.py:346-396`)
+- Precedence: `--manifest` file > latest in clusterd > embedded (only for risk ≠ stable).
+- After bootstrap stores a manifest in clusterd, editing the embedded files has no effect on that cluster.
+
+**Not to be confused with**
+- snapcraft's build manifest (`snap/manifest.yaml`)
+- Kubernetes manifests (e.g. the ORC CRDs in the `cluster-api-resources` part, `snapcraft.yaml:206`)
+
+### 5.5 Daemons, and what clusterd is
+
+**Daemons**
+- A daemon is a long-running background process managed by systemd.
+- `daemon: simple` on the `clusterd` app (`snapcraft.yaml:34-40`) makes snapd create `snap.openstack.clusterd.service`. It starts at install and at boot, and `restart-condition: on-failure` restarts it if it crashes.
+- `sunbeam`, `openstack` and `terraform` are ordinary commands that run and exit.
+- Useful commands:
+  - `snap services openstack`
+  - `sudo snap restart openstack.clusterd`
+  - `snap logs -n 100 openstack.clusterd` (or `journalctl -u snap.openstack.clusterd`)
+
+**clusterd** is a replicated database with a REST API. Each node runs a copy. It exists because the CLI is short-lived, and the deployment state has to persist and be shared between nodes.
+
+| Layer | What it does | Where |
+|---|---|---|
+| dqlite | SQLite with Raft replication | `dqlite` part, `snapcraft.yaml:81` |
+| microcluster | Membership, join tokens, mTLS between members, schema migrations, REST server | `sunbeam-microcluster/go.mod` (v2.2.0) |
+| sunbeamd | Sunbeam's tables and `/1.0/*` endpoints (§3, §4C) | `sunbeam-microcluster/` |
+
+`sunbeamd` is the process. `clusterd` is the name of the snap app and service.
+
+**Access**
+- Locally, over the unix socket `$SNAP_COMMON/state/control.socket` (`clusterd/client.py:109-114`). The socket group is `daemon.group`, which defaults to `snap_daemon`.
+- Between members, over HTTPS on port 7000 (`steps/clusterd.py:44`) with mTLS.
+
+**Lifecycle**
+- After install the daemon is running but there's no cluster yet. Python calls raise `ClusterServiceUnavailableException`.
+- Bootstrap creates a one-node cluster. Join adds a member, which then receives the replicated data.
+- Raft needs a majority of voters, so it takes three or more members to survive losing a node. With two nodes, losing either one makes the database unavailable.
+
+### 5.6 Juju relations
+
+**Terms**
+- **controller**: the Juju server that manages models.
+- **model**: a workspace on one substrate. Sunbeam has a machine model and a k8s model.
+- **charm**: the operator package that knows how to run one piece of software.
+- **application**: a deployed charm.
+- **unit**: one instance of an application.
+
+**How relations work**
+- A **relation**, which newer Juju calls an *integration* (`juju integrate`), links two applications' **endpoints**.
+- Each charm declares its endpoints as `provides` or `requires`, each with an **interface** name (for example `keystone` or `rabbitmq`). Only endpoints with matching interfaces can connect.
+- The two charms exchange settings through **relation data bags**. Each change fires `relation-joined`, `relation-changed` or `relation-broken` hooks.
+- Example: nova asks for a service user over `identity-service`, keystone writes back credentials and a URL, and nova then renders its config.
+- **Cross-model relations**: one side publishes an **offer** and the other side consumes it by **offer URL**. Sunbeam uses these between the machine model and the k8s model.
+
+**Where Sunbeam creates relations**
+1. **Terraform** `juju_integration` resources (table in §3). Example: `cloud/etc/deploy-openstack-hypervisor/main.tf:42` relates `openstack-hypervisor:amqp` to `var.rabbitmq-offer-url`. Most control-plane relations are in the external `sunbeam-terraform` plan, which `snapcraft.yaml:161` copies to `etc/deploy-openstack/`.
+2. **Python** connects the plans. It reads one plan's Terraform outputs (the offer URLs) and passes them as tfvars to the next plan, e.g. `steps/microceph.py:194-215` and `steps/hypervisor.py:112`.
+3. **Direct calls**: `JujuHelper.integrate` (`core/juju.py:367`, `:2179`), `remove_relation` (`:2196`), `consume_offer` (`:1865`), used for example at `steps/juju.py:1763`.
+
+**Debugging**
+- `juju status --relations -m <model>`
+- `juju show-unit <unit>` shows the data bags
+- `juju offers`
+- `juju debug-log --include <app>`
+
+### 5.7 How one step's output reaches the next
+
+`run_plan` (`core/common.py:317-372`) gives each step only a `StepContext` (`:243`), which carries the spinner and a reporter. Steps never see earlier steps' `Result`s during a run.
+- A `Result` (`:185`) is a `result_type` plus a free-form `message` (default `""`).
+- The results dict, keyed by step class name, goes back to the **command** after the whole plan finishes.
+
+Data moves between steps in four ways:
+
+1. **Between plans, through constructors.** The command runs a plan, reads a value with `get_step_message` or `get_step_result` (`core/common.py:375-385`), and passes it into the constructors of the next plan's steps. Constructors run when the plan list is built, so a value produced by an earlier step can only reach a later step through a new plan. That's why commands are split into plan1, plan2, and so on. Examples in `provider/local/commands.py`:
+   - management CIDR, `:719-721`
+   - join's `AddJujuMachineStep` machine ID → `ClusterUpdateNodeStep(machine_id=...)`, `:1515-1550`
+   - add's join and Juju tokens, `:1258-1282`
+   - `CreateJujuUserStep` token, `:589`, `:1356`
+2. **Within a plan, through shared external state.** These reads happen in `run()` or `is_skip()`, never in `__init__`.
+   - **clusterd**: in join's plan4, `ClusterUpdateNodeStep` writes the machine ID, and `DeployMachineApplicationStep.run` reads it back through `list_nodes_by_role` (`core/steps.py:119-137`). Config keys work the same way.
+   - **Terraform outputs**, stored as tfstate in clusterd: the hypervisor, microceph, microovn and cinder-volume steps call `openstack_tfhelper.output()` to get offer URLs (`steps/hypervisor.py:112`, `steps/microceph.py:194`, `steps/microovn.py:155`, `steps/cinder_volume.py:87`). The comment at `steps/hypervisor.py:115-121` explains why offer URLs are passed as tfvars (LP#2085310).
+   - **Juju state**: model UUIDs, unit status.
+   - **Shared Python objects** passed into many steps (`deployment`, `client`, `jhelper`, `manifest`, `tfhelper`). For example, `Deployment._manifest` is a cache.
+3. **Within one step.** `prompt()` and `is_skip()` store attributes that `run()` uses later.
+
+To pass a new value: within the same plan, write it to clusterd in step A and read it in step B's `run()`. To reach a later plan, return it as `Result.message` and pass it into the next constructor.
+
+### 5.8 Gotcha: several steps of the same class in one plan
+
+`run_plan` keys results by `step.__class__.__name__` (`core/common.py:348` for skips, `:360` for runs), so a later instance overwrites the earlier one's entry.
+- **It's common.** Join's plan4 contains `TerraformInitStep` eight times (`provider/local/commands.py:1549` onward).
+- **It's harmless today**, for three reasons:
+  - Failures raise `ClickException` immediately with the failing step's own message (`:357`, `:369`).
+  - Nobody reads the duplicated entries. Join's plan4 result isn't even kept (`:1827`).
+  - Steps whose results are read get their own small plan (`cidr_plan` at `:719`, join's plan3 at `:1515`).
+- That was checked for the callers in `provider/local/commands.py`, not for the ones in `provider/maas/commands.py` or `features/maintenance/`.
+- **The risk:** if you add a second instance of a step whose result is read, `get_step_message` silently returns the last instance. Keep any step you need to read the result of unique within its plan, or give it a plan of its own.
+- **A possible fix:** key results by index or `step.name`, or store a list per class. This changes the API of `get_step_message` and `get_step_result` and all their callers.
